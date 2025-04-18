@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 from matplotlib import pyplot as plt
 
@@ -22,27 +22,36 @@ from torch.utils.data import Dataset, DataLoader
 
 from torchvision import transforms
 
-device = 'cpu'
+device = 'cuda'
 
 prefix_path = '/home/mward19/nobackup/autodelete'
 all_labels = pd.read_csv(prefix_path + '/kaggle/input/byu-locating-bacterial-flagellar-motors-2025/train_labels.csv')
 
-def load_full_tomogram_array(tomo_id: str, train=True, device=device, suppress_progress=True):
+def load_full_tomogram_array(tomo_id: str, train=True, suppress_progress=True, save_npy=True):
     set_label = 'train' if train else 'test'
     image_dir = prefix_path + f'/kaggle/input/byu-locating-bacterial-flagellar-motors-2025/{set_label}/{tomo_id}'
+    npy_path = os.path.join(image_dir, 'tomo.npy')
 
-    # Sort and load images
+    # If .npy already exists, load it
+    if save_npy and os.path.exists(npy_path):
+        return torch.from_numpy(np.load(npy_path)).unsqueeze(1)  # (1, D, H, W)
+
+    # Otherwise load from images
     image_names = sorted(os.listdir(image_dir))
     image_paths = [os.path.join(image_dir, name) for name in image_names]
 
-    # Load images as a list of PyTorch tensors
-    layers = [transforms.ToTensor()(Image.open(image_path)) for image_path in tqdm(image_paths, desc='Loading tomogram', disable=suppress_progress)]
-    
-    # Stack into a single tensor (1, D, H, W) and move to device
-    tomo_tensor = torch.stack(layers, dim=1).to(device)  # Shape: (Depth, Height, Width)
+    layers = [
+        transforms.ToTensor()(Image.open(image_path))
+        for image_path in tqdm(image_paths, desc='Loading tomogram', disable=suppress_progress)
+    ]
 
-    # Expand the channel dimension
-    return tomo_tensor.unsqueeze(1)
+    tomo_tensor = torch.stack(layers, dim=1)  # Shape: (1, D, H, W)
+
+    # Save as .npy if requested
+    if save_npy:
+        np.save(npy_path, tomo_tensor.squeeze(1).numpy())  # Remove channel dim before saving
+
+    return tomo_tensor
 
 def create_point_mask(image_shape, center, radius, device):
     """
@@ -144,8 +153,8 @@ class TomoDataset(Dataset):
             *,
             mask_mode: bool = False, # Whether to return masks for points or just list of points in a tomogram
             tile_mode: bool = True, 
-            tile_size = (64, 128, 128), # Size of tiles in original tomogram
-            tile_resize = (32, 32, 32), # Size to resize tiles to when loaded
+            tile_size=(64, 128, 128), # Size of tiles in original tomogram
+            tile_resize=(32, 32, 32), # Size to resize tiles to when loaded
             train: bool = True, # Train or test
             transform=None
         ):
@@ -154,26 +163,30 @@ class TomoDataset(Dataset):
         self.voxel_spacings = dict()
         self.shapes = dict()
         self.mask_mode = mask_mode
-
-        # Things only useful in tile mode
         self.tile_mode = tile_mode
+        self.tile_size = tile_size
+        self.tile_resize = tile_resize
+        self.train = train
+        self.transform = transform
+
+        # What to multiply by to take original dimensions to the resized ones
         if self.tile_mode:
             self.tile_positions = dict()
-            self.tile_size = tile_size
-            self.tile_resize = tile_resize
-            # What to multiply by to take original dimensions to the resized ones
-            self.resize_factors = np.array([new_dim / old_dim for new_dim, old_dim in zip(self.tile_resize, self.tile_size)])
-        self.train = train
+            self.resize_factors = np.array([
+                new_dim / old_dim 
+                for new_dim, old_dim in zip(self.tile_resize, self.tile_size)
+            ])
+            # Flat index across all tiles in all tomograms
+            self.index_map = []
+
         ids_seen = set()
         
         for i, row in all_labels.iterrows():
-            # Each row might contain a motor. If it doesn't, just move on
-            if row['Number of motors'] == 0:
-                continue
+            # Each row might contain a motor.
             tomo_id = row['tomo_id']
-            motor_loc = tuple([row[f'Motor axis {axis}'] for axis
-                               in range(3)])
-            self.motors[tomo_id].append(motor_loc)
+            if row['Number of motors'] > 0:
+                motor_loc = tuple([row[f'Motor axis {axis}'] for axis in range(3)])
+                self.motors[tomo_id].append(motor_loc)
 
             # Save other data that only needs to be seen once per tomogram data row
             if tomo_id in ids_seen:
@@ -184,14 +197,18 @@ class TomoDataset(Dataset):
             self.shapes[tomo_id] = tomo_shape
             ids_seen.add(tomo_id)
 
-            if self.tile_mode:
+        self.tomo_ids = list(data_df['tomo_id'])
+
+        # Compute tile positions and flat indices
+        if self.tile_mode:
+            for tomo_index, tomo_id in enumerate(self.tomo_ids):
                 self.tile_positions[tomo_id] = tile_tomogram(
-                    tomo_shape, 
-                    fm_voxels(tomo_voxel_spacing), 
+                    self.shapes[tomo_id], 
+                    fm_voxels(self.voxel_spacings[tomo_id]), 
                     self.tile_size
                 )
-            
-        self.tomo_ids = list(data_df['tomo_id'])
+                for tile_index in range(len(self.tile_positions[tomo_id])):
+                    self.index_map.append((tomo_index, tile_index))
         
     def num_tiles(self, tomo_index):
         if not self.tile_mode:
@@ -206,15 +223,33 @@ class TomoDataset(Dataset):
         tile_pos = self.tile_positions[tomo_id][tile_index]
         return tile_pos, self.tile_size
     
-    
     def __len__(self):
-        return len(self.tomo_ids)
+        if self.tile_mode:
+            return len(self.index_map)
+        else:
+            return len(self.tomo_ids)
     
-    def point_to_tile_loc():
+    def point_to_tile_loc(self):
         pass # TODO
-    def tile_loc_to_point():
+
+    def tile_loc_to_point(self):
         pass # TODO
     
+    def has_points(self, tomo_index, tile_index=None):
+        tomo_id = self.tomo_ids[tomo_index]
+
+        if tile_index is None:
+            # Full tomogram: check if any motors exist
+            return len(self.motors[tomo_id]) > 0
+        else:
+            # Tile: check if any motors fall within this tile
+            tile_pos = self.tile_positions[tomo_id][tile_index]
+            for p in self.motors[tomo_id]:
+                if point_in_tile(p, tile_pos, self.tile_size):
+                    return True
+            return False
+
+
     def load_tile(self, tomo_index, tile_index):
         tomo_id = self.tomo_ids[tomo_index]
         voxel_spacing = self.voxel_spacings[tomo_id]
@@ -225,6 +260,7 @@ class TomoDataset(Dataset):
             self.tile_size,
             self.train
         )
+
         # Load all motor positions in this tile, relative to the tile
         points = [np.array(p) - np.array(tile_pos) 
                     for p in self.motors[tomo_id] 
@@ -236,6 +272,11 @@ class TomoDataset(Dataset):
 
         # Scale voxel sizing by average factor (this is kind of a dumb assumption)
         voxel_spacing_resized = voxel_spacing * np.mean(self.resize_factors)
+
+        # Apply transform if given
+        if self.transform:
+            tile_array_resized = self.transform(tile_array_resized)
+
         if self.mask_mode:
             mask = create_mask(self.tile_resize, points_resized, voxel_spacing_resized)
             return tile_array_resized, mask, voxel_spacing_resized
@@ -245,34 +286,72 @@ class TomoDataset(Dataset):
     def load_full_tomo(self, tomo_index):
         tomo_id = self.tomo_ids[tomo_index]
         image_array = load_full_tomogram_array(tomo_id, self.train)
+
         # TODO: make this depend on motor size
         radius = 50
         motors = self.motors[tomo_id]
         voxel_spacing = self.voxel_spacings[tomo_id]
+
         if self.mask_mode:
             truth_mask = create_mask(image_array.shape, motors, radius, device)
             return image_array, truth_mask, voxel_spacing
         else:
             return image_array, motors, voxel_spacing
 
-    def __getitem__(self, indices):
+    def __getitem__(self, index):
         """ 
-        If in tile mode (self.tile_mode), indices is a tuple of the tomogram's index and the tile index.
-        Otherwise it is just an integer representing the index of the tomogram.
+        If in tile mode (self.tile_mode), index is an int which is used to
+        look up (tomo_index, tile_index) from a flat list. Otherwise it is
+        just an integer representing the index of the tomogram.
         """
         if self.tile_mode:
-            if isinstance(indices, int):
-                raise Exception('In tile mode, loading data requires two indices -- one for the tomogram, and one for the tile.')
-            tomo_index, tile_index = indices
+            tomo_index, tile_index = self.index_map[index]
             return self.load_tile(tomo_index, tile_index)
         else:
-            index = indices
             return self.load_full_tomo(index)
-    
+
     def collate_fn(self, batch):
-        """ DataLoaders will get very mad at this class with batch sizes bigger
+        """ 
+        DataLoaders will get very mad at this class with batch sizes bigger
         than 1 since the labels are lists. This should be used as the collate_fn
-        in the DataLoader initialization. """
+        in the DataLoader initialization.
+        """
         images, labels, spacings = zip(*batch)
-        images = torch.stack(images)
+        images = torch.stack([img.squeeze(0) for img in images]) # Don't duplicate batch dim
         return images, labels, spacings
+    
+    def label_balance(self):
+        """
+        Returns the proportion of tiles or tomograms in this set that have at
+        least one point
+        """
+        count = 0
+        total = len(self)
+
+        for index in trange(total, desc='Calculating class label balance'):
+            if self.tile_mode:
+                tomo_index, tile_index = self.index_map[index]
+                if self.has_points(tomo_index, tile_index):
+                    count += 1
+            else:
+                if self.has_points(index):
+                    count += 1
+
+        return count / total
+
+    def get_sampler(self, pos_prob) -> torch.utils.data.WeightedRandomSampler:
+        """
+        Returns a WeightedRandomSampler that samples positives with `pos_prob`
+        and negatives with `1 - pos_prob`. Only works in tile mode.
+        """
+        assert self.tile_mode, "get_sampler only works in tile mode."
+
+        labels = []
+        for index in range(len(self)):
+            tomo_index, tile_index = self.index_map[index]
+            label = int(self.has_points(tomo_index, tile_index))  # 1 = positive, 0 = negative
+            labels.append(label)
+
+        weights = [pos_prob if label == 1 else 1 - pos_prob for label in labels]
+        sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        return sampler
