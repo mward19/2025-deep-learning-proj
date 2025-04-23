@@ -1,1 +1,1 @@
-Project for deep learning class. Using BYU's supercomputer to experiment with [dataset I made](https://www.kaggle.com/competitions/byu-locating-bacterial-flagellar-motors-2025) for my research group's Kaggle competition 
+Project for deep learning class. Using BYU's supercomputer to experiment with [dataset I helped make](https://www.kaggle.com/competitions/byu-locating-bacterial-flagellar-motors-2025) for my research group's Kaggle competition 
